@@ -49,12 +49,7 @@ const int keyPin   = 17;  // key out
 #define PDLSWAP   0x08  //  0 for normal, 1 for swap
 #define IAMBICB   0x10  //  0 for Iambic A, 1 for Iambic B
 #define STRAITKEY 0x20  //  0 for paddle, 1 for strait key
-
-byte  minWPM = 5;
-byte  maxWPM = 45;
-short  potRange = 255;
-
-#define PTT_DELAY 63    //  6 times dit time
+#define PTT_DELAY 6     //  6 times dit time
 #define DEBOUNCE  20
 #define BUFFER_SIZE 32
 
@@ -73,8 +68,8 @@ short  potRange = 255;
 unsigned long ditTime;        // No. milliseconds per dit
 unsigned char keyerControl;
 unsigned char keyerState;
-unsigned char note = 535;
-unsigned char ptt = false;
+unsigned char note = 600;
+boolean       isPTTDown = false;
 unsigned int  pttdelay = 500;
 unsigned int  rtxdelay = 175;
 int           speedPot;
@@ -85,16 +80,98 @@ byte          currentWPM = 25;
 byte          buffer[BUFFER_SIZE];
 byte          bufLocGet = 0;
 byte          bufLocPut = 0;
+boolean       isKeyDown = false;
+long          ktimer;  //  timer for keydown
+long          ptimer;  //  timer for ptt
+long          rtimer;  //  timer for rx/tx trans
+byte          minWPM = 5;
+byte          maxWPM = 45;
+short         potRange = 255;
 
-
-///////////////////////////////////////////////////////////////////////////////
-//
-//  State Machine Defines
+struct {
+  byte len;
+  byte code;
+} MorseCode[] = {
+  {6, B10101100}, //  ! = 0x21
+  {6, B01001000}, //  "
+  {0, 0}, //  #
+  {7, B00010010}, //  $
+  {0, 0}, //  %
+  {5, B01000000}, //  &
+  {6, B01111000}, //  '
+  {5, B10110000}, //  (
+  {6, B10110100}, //  )
+  {0, 0}, //  *
+  {5, B01010000}, //  +
+  {6, B11001100}, //  ,
+  {6, B10000100}, //  -
+  {6, B01010100}, //  .
+  {5, B10010000}, //  /
+  {5, B11111000}, //  0
+  {5, B01111000}, //  1
+  {5, B00111000}, //  2
+  {5, B00011000}, //  3
+  {5, B00001000}, //  4
+  {5, B00000000}, //  5
+  {5, B10000000}, //  6
+  {5, B11000000}, //  7
+  {5, B11100000}, //  8
+  {5, B11110000}, //  9
+  {6, B11100000}, //  :
+  {6, B10101000}, //  ;
+  {0, 0}, //  <
+  {5, B10001000}, //  =
+  {0, 0}, //  >
+  {6, B00110000}, //  ?
+  {6, B01101000}, //  @
+  {2, B01000000}, //  A
+  {4, B10000000}, //  B
+  {4, B10100000}, //  C
+  {3, B10000000}, //  D
+  {1, B00000000}, //  E
+  {4, B00100000}, //  F
+  {3, B11000000}, //  G
+  {4, B00000000}, //  H
+  {2, B00000000}, //  I
+  {4, B01110000}, //  J
+  {3, B10100000}, //  K
+  {4, B01000000}, //  L
+  {2, B11000000}, //  M
+  {2, B10000000}, //  N
+  {3, B11100000}, //  O
+  {4, B01100000}, //  P
+  {4, B11010000}, //  Q
+  {3, B01000000}, //  R
+  {3, B00000000}, //  S
+  {1, B10000000}, //  T
+  {3, B00100000}, //  U
+  {4, B00010000}, //  V
+  {3, B01100000}, //  W
+  {4, B10010000}, //  X
+  {4, B10110000}, //  Y
+  {4, B11000000}, //  Z
+  {0, 0}, //  [
+  {0, 0}, //  \
+  {0, 0}, //  ]
+  {0, 0}, //  ^
+  {6, B00110100}, //  _
+  {6, B11001100}, //  ` as ' = 0x60
+};
 
 enum KSTYPE {
   IDLE, CHK_DIT, CHK_DAH, KEYED_TRANS, KEYED, 
   INTER_ELEMENT, SK_DOWN 
 };
+
+enum AKSTATE {
+  AK_NONE, AK_KD, AK_KU, AK_INTER,
+};
+
+byte akState = AK_NONE;
+byte akChar;
+byte akBit;
+byte akMask;
+long akTimer;
 
 ///////////////////////////////////////////////////////////////////////////////
 //
@@ -117,34 +194,12 @@ void setup() {
   digitalWrite(rLedPin, HIGH);  // turn the LED off
   digitalWrite(gLedPin, HIGH);  // turn the LED off
   
-  if ( digitalRead(LPin) == LOW )
+  if ( digitalRead(LPin) == LOW ) {
     isStrait = true;
+  }
   
-  digitalWrite(gLedPin, LOW);
-  digitalWrite(rLedPin, LOW);
-  tone(tonePin, note);
-  delay(100);
-  digitalWrite(gLedPin, HIGH);
-  digitalWrite(rLedPin, HIGH);
-  noTone(tonePin);
-  delay(100);
-  digitalWrite(gLedPin, LOW);
-  digitalWrite(rLedPin, LOW);
-  tone(tonePin, note);
-  delay(300);
-  digitalWrite(gLedPin, HIGH);
-  digitalWrite(rLedPin, HIGH);
-  noTone(tonePin);
-  delay(100);
-  digitalWrite(gLedPin, LOW);
-  digitalWrite(rLedPin, LOW);
-  tone(tonePin, note);
-  delay(100);
-  digitalWrite(gLedPin, HIGH);
-  digitalWrite(rLedPin, HIGH);
-  noTone(tonePin);
-  delay(100);
-  
+  bufPut('R');
+ 
   if ( digitalRead(LPin) == HIGH )
     isStrait = false;
   
@@ -166,10 +221,6 @@ void setup() {
 //
 ///////////////////////////////////////////////////////////////////////////////
 
-long ktimer;  //  timer for keydown
-long ptimer;  //  timer for ptt
-long rtimer;  //  timer for rx/tx trans
-
 void loop()
 {
   // Basic Iambic Keyer
@@ -181,36 +232,33 @@ void loop()
   
   switch (keyerState) {
   case IDLE:
+    checkAK();
     // Wait for direct or latched paddle press
     if ( keyerControl & STRAITKEY ) {
       if ( digitalRead(RPin) == LOW ) {
-        if ( !ptt ) {
-          ptt = true;
-          digitalWrite(pttPin, LOW);         // enable PTT
-          digitalWrite(gLedPin, LOW);
+        if ( !isPTTDown ) {
+          pttDown();
         }
-        digitalWrite(rLedPin, LOW);         // turn the LED on
-        tone( tonePin, note );
+        keyDown();
         ktimer = millis()+DEBOUNCE;
         keyerState = SK_DOWN;
       }
     } else if ((digitalRead(LPin) == LOW) ||
         (digitalRead(RPin) == LOW) ||
         (keyerControl & 0x03) ) {
+      if ( isKeyDown ) {
+        keyUp();
+      }
       update_PaddleLatch();
       keyerState = CHK_DIT;
     }
-    if ( ptt && (millis() >= ptimer) ) {
-      digitalWrite(pttPin, HIGH);  // turn PTT off
-      digitalWrite(gLedPin, HIGH);
-      ptt = false;
+    if ( isPTTDown && (millis() >= ptimer) ) {
+      pttUp();
     }
     break;
   case SK_DOWN:
     if ( millis() > ktimer && digitalRead(RPin) == HIGH ) {
-      Serial.println("hr");
-      digitalWrite(rLedPin, HIGH);         // turn the LED off
-      noTone( tonePin);
+      keyUp();
       ptimer = millis()+pttdelay;
       keyerState = IDLE;
     }
@@ -240,10 +288,9 @@ void loop()
     }
     break;
   case KEYED_TRANS:
-    if ( ptt || millis() >= rtimer+rtxdelay ) {
-      ptt = true;
-      digitalWrite(rLedPin, LOW);         // turn the LED on
-      tone( tonePin, note );
+    if ( isPTTDown || millis() >= rtimer+rtxdelay ) {
+      isPTTDown = true;
+      keyDown();
       ktimer += millis();                 // set ktimer to interval end time
       keyerControl &= ~(DIT_L + DAH_L);   // clear both paddle latch bits
       keyerState = KEYED;                 // next state
@@ -252,8 +299,7 @@ void loop()
   case KEYED:
     // Wait for timer to expire
     if (millis() > ktimer) {            // are we at end of key down ?
-      digitalWrite(rLedPin, HIGH);      // turn the LED off
-      noTone( tonePin );
+      keyUp();
       ktimer = millis() + ditTime 
         * (2-weight/50.0);    // inter-element time
       keyerState = INTER_ELEMENT;     // next state
@@ -278,14 +324,112 @@ void loop()
     break;
   }
 }
-        
-///////////////////////////////////////////////////////////////////////////////
-//
-//    Latch dit and/or dah press
-//
-//    Called by keyer routine
-//
-///////////////////////////////////////////////////////////////////////////////
+      
+void pttDown()
+{
+  // Serial.println("ptt down");
+  digitalWrite(pttPin, LOW);         // enable PTT
+  digitalWrite(gLedPin, LOW);
+  isPTTDown = true;
+  ptimer = millis() + 1e10;
+} 
+
+void pttUp()
+{
+  // Serial.println("ptt up");
+  digitalWrite(pttPin, HIGH);  // turn PTT off
+  digitalWrite(gLedPin, HIGH);
+  isPTTDown = false;
+} 
+
+void keyDown()
+{
+  digitalWrite(rLedPin, LOW);         // turn the LED on
+  digitalWrite(keyPin, HIGH); 
+  tone( tonePin, note );
+  isKeyDown = true;
+}
+
+void keyUp()
+{
+  digitalWrite(rLedPin, HIGH);      // turn the LED off
+  digitalWrite(keyPin, HIGH); 
+  noTone( tonePin );
+  isKeyDown = false;
+}
+
+void checkAK()
+{
+  int ch;
+  switch ( akState ) {
+  case AK_NONE:
+    ch = bufGet();
+    if ( ch >-1 ) {
+      if ( ch >= 'a' && ch <= 'z' ) {
+        ch = ch - ('a'-'A');
+      }
+      if ( ch == ' ' ) {
+        akTimer = millis() + 5 * ditTime * (2-weight/50.0);
+        akState = AK_INTER;
+      } else {
+        akChar = ch - 0x21;
+        if ( MorseCode[akChar].len >0 ) {
+          akBit = 1;
+          akMask = 0x80;
+          // if ( !isPTTDown ) {
+            pttDown();
+          // }
+          keyDown();
+          calAKTimer();
+          akState = AK_KD;
+        }
+      }
+    } 
+    // else if ( isPTTDown && millis() >= akTimer ) {
+    //   Serial.println("ptt-up");
+    //   pttUp();
+    // }
+    break;
+  case AK_KD:
+    if ( millis() >= akTimer ) {
+      keyUp();
+      akTimer = millis() + ditTime * (2-weight/50.0);
+      akState = AK_KU;
+    }
+    break;
+  case AK_KU:
+    if ( millis() >= akTimer ) {
+      akBit++;
+      akMask >>= 1;
+      if ( akBit > MorseCode[akChar].len ) {
+        akTimer = millis() + 2 * ditTime * (2-weight/50.0);
+        akState = AK_INTER;
+      } else {
+        keyDown();
+        calAKTimer();
+        akState = AK_KD;
+      }
+    }
+    break;
+  case AK_INTER:
+    if ( millis() >= akTimer ) {
+      ptimer = millis() + pttdelay;
+      akState = AK_NONE;
+    }
+    break;
+  }
+}
+
+void calAKTimer()
+{
+  if ( MorseCode[akChar].code & akMask ) {
+    // Serial.print("-");
+    akTimer = millis() + 3 * ditTime * (2-weight/50.0);
+  } else {
+    // Serial.print(".");
+    akTimer = millis() + ditTime * (2-weight/50.0);
+  }
+}
 
 void update_PaddleLatch()
 {
@@ -331,8 +475,9 @@ void setSpeed(byte wpm)
 
 void keyedPrep()
 {
-  digitalWrite(pttPin, LOW);         // enable PTT
-  digitalWrite(gLedPin, LOW);
+  if ( !isPTTDown ) {
+    pttDown();
+  }
   rtimer = millis();
 }
 
@@ -365,13 +510,24 @@ void bufLocGetDec()
     bufLocGet = BUFFER_SIZE -1;
 }
 
-void bufPutin(byte b)
+void bufPut(byte b)
 {
-  buffer[bufLocPut++] = ch;
+  buffer[bufLocPut++] = b;
   if ( bufLocPut == BUFFER_SIZE ) {
     bufLocPut = 0;
   }
   //  TODO: roll back to LocGet
+}
+
+//  return -1 if no char in buffer
+int bufGet()
+{
+  int ret = -1;
+  if ( bufLocGet != bufLocPut ) {
+    ret = buffer[bufLocGet];
+    bufLocGetInc();
+  } 
+  return ret;
 }
 
 void checkSerial()
@@ -383,10 +539,20 @@ void checkSerial()
     1, 1, 1, 1, 2, 3, 1, 0, 0, 1, 0, 1, 1, 1, 1, 15, 
     1, 1, 1, 0, 1, 0, 1, 1, 1, 1, 1, 2, 1, 1, 0, 0 
   };  //  number of bytes after the first byte
-  static void (*cmdfun[33])(byte buf[]) = {
-    cmdAdmin, cmdSidetone, cmdSpeed, cmdWeight, cmdPTTTime,
-    cmdSpeedRange, cmdPause, cmdGetSpeed, cmdBackspace,
-    cmdPinConfig, cmdClearBuffer
+  static void (*cmdfun[])(byte buf[]) = {
+    //  00-03
+    cmdAdmin, cmdSidetone, cmdSpeed, cmdWeight, 
+    //  04-07
+    cmdPTTTime, cmdSpeedRange, cmdPause, cmdGetSpeed, 
+    //  08-0B
+    cmdBackspace, cmdPinConfig, cmdClearBuffer,
+    cmdKeyImd, 
+    //  0C-0F
+    cmdHSCW, cmdFarnWPM, cmdSetMode, cmdDefault,
+    //  10-13
+    cmdSetExt, cmdKeyComp, cmdPadSw, cmdNOP,
+    //  14-17
+    cmdSoftPad, cmdGetStatus, cmdPointer, cmdSetRatio,
   };
 
   if ( Serial.available() >0 ) {
@@ -395,8 +561,8 @@ void checkSerial()
       if ( ch >=0 && ch < 32 ) {
         serialLen = cmdLen[ch];
         serialBuf[serialLoc++] = ch;
-      } else {
-        bufPutin(ch);
+      } else if ( ch >= 0x20 && ch <= 0x80 ) {
+        bufPut(ch);
       }
     } else {
       serialBuf[serialLoc++] = ch;
@@ -409,7 +575,11 @@ void checkSerial()
       serialLen--;
     }
     if ( serialLoc > 0 && serialLen == 0 ) {
-      (*cmdfun[serialBuf[0]])(serialBuf+1);
+      if ( serialBuf[0] < 0x18 ) {
+        (*cmdfun[serialBuf[0]])(serialBuf+1);
+      } else {
+        //  put it into buffer
+      }
       serialLoc = 0;
     }
   } //  if Serial.available() >0
@@ -442,7 +612,7 @@ void cmdAdmin(byte buf[])
 void cmdSidetone(byte buf[])
 {
   static short sidetone[] = {
-    3759, 1879, 1252, 940, 752, 625, 535, 469, 417, 375
+    4000, 2000, 1333, 1000, 800, 666, 571, 500, 444, 400
   };
 
   if ( buf[0] >=1 && buf[0] <=10 ) {
@@ -504,10 +674,117 @@ void cmdBackspace(byte buf[])
 
 void cmdPinConfig(byte buf[])
 {
-
+  //  do nothing in this box
 }
 
 void cmdClearBuffer(byte buf[])
 {
   bufLocGet = bufLocPut = 0;
 }
+
+void cmdKeyImd(byte buf[])  //  0x0B
+{
+
+}
+
+void cmdHSCW(byte buf[])  //  0x0C
+{
+
+}
+
+void cmdFarnWPM(byte buf[])  //  0x0D
+{
+
+}
+
+void cmdSetMode(byte buf[])  //  0x0E
+{
+
+}
+
+void cmdDefault(byte buf[])  //  0x0F
+{
+
+}
+
+void cmdSetExt(byte buf[])  //  0x10
+{
+
+}
+
+void cmdKeyComp(byte buf[])  //  0x11
+{
+
+}
+
+void cmdPadSw(byte buf[])  //  0x12
+{
+
+}
+
+void cmdNOP(byte buf[])  //  0x13
+{
+
+}
+
+void cmdSoftPad(byte buf[])  //  0x14
+{
+
+}
+
+void cmdGetStatus(byte buf[])  //  0x15
+{
+
+}
+
+void cmdPointer(byte buf[])  //  0x16
+{
+
+}
+
+void cmdSetRatio(byte buf[])  //  0x17
+{
+
+}
+
+void cmdBPTT(byte buf[])  //  0x18
+{
+
+}
+
+void cmdBKey(byte buf[])  //  0x19
+{
+
+}
+
+void cmdBWait(byte buf[])  //  0x1A
+{
+
+}
+
+void cmdBMerge(byte buf[])  //  0x1B
+{
+
+}
+
+void cmdBSpeed(byte buf[])  //  0x1C
+{
+
+}
+
+void cmdBHSpeed(byte buf[])  //  0x1D
+{
+
+}
+
+void cmdBCancelSpeed(byte buf[])  //  0x1E
+{
+
+}
+
+void cmdBNOP(byte buf[])  //  0x1F
+{
+
+}
+
+
