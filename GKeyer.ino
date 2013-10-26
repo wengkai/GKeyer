@@ -1,3 +1,4 @@
+
 ///////////////////////////////////////////////////////////////////////////////
 //
 //  Golf Morse Code Keyer Sketch
@@ -29,7 +30,8 @@
 //
 ///////////////////////////////////////////////////////////////////////////////
 
-#include <EEPROM.h>
+#include "EEPROM.h"
+
 
 //
 // Digital Pins
@@ -72,15 +74,16 @@ const int keyPin   = 17;  // key out
 unsigned long ditTime;        // No. milliseconds per dit
 unsigned char keyerControl;
 unsigned char keyerState;
-unsigned char note = 600;
+unsigned char noteIndex = 6;
 boolean       isPTTDown = false;
 unsigned int  pttdelay = 500;
-unsigned int  rtxdelay = 175;
+unsigned int  rtxdelay = 200; //  175;
 int           speedPot;
 boolean       isSpeedOverride = false;  //  true if speed is set by host
 int           weight = 50;
 boolean       isPause = false;  //  true to pause the queue
 byte          currentWPM = 25;
+byte          origWPM = 0;
 byte          buffer[BUFFER_SIZE];
 byte          bufLocGet = 0;
 byte          bufLocPut = 0;
@@ -100,6 +103,12 @@ byte          wk2mode = 0;
 byte          firstExtensionTime = 0;
 byte          keyingCompensation = 0;
 float         didahRatio = 3.0;
+long          bfKeyDwnTimer = -1;
+boolean       isMerge = false;
+
+short sidetone[] = {
+  4000, 2000, 1333, 1000, 800, 666, 571, 500, 444, 400
+};
 
 enum {
   WKM_CTSPACE   = 0x01,
@@ -186,7 +195,7 @@ enum KSTYPE {
 };
 
 enum AKSTATE {
-  AK_NONE, AK_KD, AK_KU, AK_INTER,
+  AK_NONE, AK_RTX, AK_KD, AK_KU, AK_INTER,
 };
 
 byte akState = AK_NONE;
@@ -220,19 +229,24 @@ void setup() {
   if ( digitalRead(LPin) == LOW ) {
     isStrait = true;
   }
-  
-  bufPut('R');
- 
+   
   if ( digitalRead(LPin) == HIGH )
     isStrait = false;
   
-  Serial.begin(9600);
+  Serial.begin(1200);
   
   keyerState = IDLE;
   keyerControl = IAMBICB;      // Or 0 for IAMBICA
-  if ( isStrait )
-    keyerControl |= STRAITKEY;
   
+  if ( isStrait ) {
+    keyerControl |= STRAITKEY;
+    bufPut('S');
+  } else {
+    bufPut('R');
+  }
+
+  loadParams();
+
   checkSpeed();
   
   prompt();
@@ -257,6 +271,11 @@ void loop()
       keyUp();
       pttUp();
     }
+    if ( bfKeyDwnTimer >-1 && millis() > bfKeyDwnTimer ) {
+      keyUp();
+      pttUp();
+      bfKeyDwnTimer = -1;  
+    }
   }
   switch (keyerState) {
   case IDLE:
@@ -267,7 +286,7 @@ void loop()
         if ( !isPTTDown ) {
           pttDown();
         }
-        keyDown();
+        keyDown(true);
         ktimer = millis()+DEBOUNCE;
         keyerState = SK_DOWN;
       }
@@ -280,7 +299,8 @@ void loop()
       update_PaddleLatch();
       keyerState = CHK_DIT;
     }
-    if ( isPTTDown && (millis() >= ptimer) ) {
+    if ( isPTTDown && ptimer >-1 && millis() >= ptimer ) {
+//      Serial.println(ptimer);
       pttUp();
     }
     break;
@@ -318,7 +338,8 @@ void loop()
   case KEYED_TRANS:
     if ( isPTTDown || millis() >= rtimer+rtxdelay ) {
       isPTTDown = true;
-      keyDown();
+      keyDown(true);
+      bfKeyDwnTimer = -1;
       ktimer += millis();                 // set ktimer to interval end time
       keyerControl &= ~(DIT_L + DAH_L);   // clear both paddle latch bits
       keyerState = KEYED;                 // next state
@@ -355,27 +376,33 @@ void loop()
       
 void pttDown()
 {
-  // Serial.println("ptt down");
-  digitalWrite(pttPin, LOW);         // enable PTT
-  digitalWrite(gLedPin, LOW);
-  isPTTDown = true;
-  ptimer = millis() + 1e10;
+  if ( !isPTTDown ) {
+//    Serial.println("ptt down");
+    digitalWrite(pttPin, LOW);         // enable PTT
+    digitalWrite(gLedPin, LOW);
+    isPTTDown = true;
+    ptimer = -1;
+  }
 } 
 
 void pttUp()
 {
-  // Serial.println("ptt up");
+//  Serial.println("ptt up");
   digitalWrite(pttPin, HIGH);  // turn PTT off
   digitalWrite(gLedPin, HIGH);
   isPTTDown = false;
 } 
 
-void keyDown()
+void keyDown(boolean isPaddle)
 {
-  digitalWrite(rLedPin, LOW);         // turn the LED on
-  digitalWrite(keyPin, HIGH); 
-  if ( isSidetone) tone( tonePin, note );
   if ( !isKeyDown ) {
+    digitalWrite(rLedPin, LOW);         // turn the LED on
+    digitalWrite(keyPin, HIGH); 
+    if ( isSidetone || isPaddle ) {
+      tone( tonePin, sidetone[noteIndex] );
+      // Serial.println(isSidetone);
+      // Serial.println(isPaddle);
+    }
     isKeyDown = true;
     keyWDTimer = millis() + KEY_WD_TIMER;
   }
@@ -391,48 +418,70 @@ void keyUp()
 
 void checkAK()
 {
+  static void (*cmdfun[])() = {
+    cmdBPTT, cmdBKey, cmdBWait, cmdBMerge,
+    cmdBSpeed, cmdBHSpeed, cmdBCancelSpeed,
+    cmdBNOP
+  };
   int ch;
   switch ( akState ) {
   case AK_NONE:
     if ( isPause ) return;
     ch = bufGet();
     if ( ch >-1 ) {
-      if ( ch >= 'a' && ch <= 'z' ) {
-        ch = ch - ('a'-'A');
-      }
-      if ( ch == ' ' || ch == '|' ) {
-        int basetime;
-        if ( farmWPM == 0 ) {
-          basetime = ditTime * (2-weight/50.0);
-        } else {
-          basetime = 1200/farmWPM * (2-weight/50.0);
-        }
-        if ( ch == ' ' ) {
-          akTimer = millis() + 
-            (wk2mode&WKM_CTSPACE?6:7)
-            * basetime;
-        } else {
-          akTimer = millis() + 0.5 * basetime;
-        }
-        akState = AK_INTER;
+      ptimer = -1;
+      if ( ch < 0x20 ) {  //  buffered cmd
+        (*cmdfun[ch-0x18])();
       } else {
-        akEcho = ch;
-        if ( isCutMode ) {
-          if ( ch == '0' )  ch = 'T';
-          else if ( ch == '9' ) ch = 'N';
-        }
-        akChar = ch - 0x21;
-        if ( MorseCode[akChar].len >0 ) {
-          akBit = 1;
-          akMask = 0x80;
-          pttDown();
-          keyDown();
-          calAKTimer();
-          akTimer += firstExtensionTime;
-          akState = AK_KD;
+//        Serial.println((char)ch);
+        if ( ch == ' ' || ch == '|' ) {
+          int basetime;
+          if ( farmWPM == 0 ) {
+            basetime = ditTime * (2-weight/50.0);
+          } else {
+            basetime = 1200/farmWPM * (2-weight/50.0);
+          }
+          if ( ch == ' ' ) {
+            akTimer = millis() + 
+              (wk2mode&WKM_CTSPACE?4:5)
+              * basetime;
+          } else {
+            akTimer = millis() + 0.5 * basetime;
+          }
+          akState = AK_INTER;
+        } else {
+          if ( ch >= 'a' && ch <= 'z' ) {
+            ch = ch - ('a'-'A');
+          }
+          akEcho = ch;
+          if ( isCutMode ) {
+            if ( ch == '0' )  ch = 'T';
+            else if ( ch == '9' ) ch = 'N';
+          }
+          akChar = ch - 0x21;
+          if ( MorseCode[akChar].len >0 ) {
+            akBit = 1;
+            akMask = 0x80;
+            if ( !isPTTDown ) {
+              pttDown();
+              akTimer = millis() + rtxdelay;
+            } else {
+              akTimer = millis();
+            }
+            akState = AK_RTX;
+            // sendStatus();
+          }
         }
       }
     } 
+    break;
+  case AK_RTX:
+    if ( millis() >= akTimer ) {
+      keyDown(false);
+      calAKTimer();
+      akTimer += firstExtensionTime;
+      akState = AK_KD;
+    }
     break;
   case AK_KD:
     if ( millis() >= akTimer ) {
@@ -449,11 +498,18 @@ void checkAK()
       akMask >>= 1;
       if ( akBit > MorseCode[akChar].len ) {
         long space;
-        if ( farmWPM == 0 ) {
-          space = 2 * ditTime * (2-weight/50.0);
+        if ( isMerge ) {
+          isMerge = false;
+          space = 0;
         } else {
-          space = 3 * 1200/farmWPM * (2-weight/50.0) 
-            - ditTime * (2-weight/50.0);
+          if ( farmWPM == 0 ) {
+            //  space should be 3*dit, but at this
+            //  moment, one dit space has passed
+            space = 2 * ditTime * (2-weight/50.0);
+          } else {
+            space = 3 * 1200/farmWPM * (2-weight/50.0) 
+              - ditTime * (2-weight/50.0);
+          }
         }
         akTimer = millis() + space;
         akState = AK_INTER;
@@ -461,7 +517,7 @@ void checkAK()
           Serial.write(akEcho);
         }
       } else {
-        keyDown();
+        keyDown(false);
         calAKTimer();
         akState = AK_KD;
       }
@@ -469,8 +525,11 @@ void checkAK()
     break;
   case AK_INTER:
     if ( millis() >= akTimer ) {
+//      Serial.print("L490:");
       ptimer = millis() + pttdelay;
+//      Serial.println(millis());
       akState = AK_NONE;
+      // sendStatus();
     }
     break;
   }
@@ -518,11 +577,12 @@ void checkSpeed()
       a0 = map(a0, 0, 1023, 0, potRange *4 );
       wpm = map(a0, 0, 1023, minWPM, maxWPM);
       setSpeed(wpm);
+      sendSpeed();
       pttdelay = PTT_DELAY * ditTime;
       if ( wpm >= 30 ) 
         rtxdelay = 5;
       else 
-        rtxdelay = 175;
+        rtxdelay = 200; //175;
     }
   }
 }
@@ -543,7 +603,7 @@ void keyedPrep()
 
 void prompt()
 {
-  Serial.println("GKeyer v0.1\t(C)BA5AG 2013");
+  Serial.println("GKeyer v0.2\t(C)BA5AG 2013");
   if ( keyerControl & STRAITKEY ) {
     Serial.print("Strait Key Mode");
   } else {
@@ -576,6 +636,8 @@ void bufPut(byte b)
   if ( bufLocPut == BUFFER_SIZE ) {
     bufLocPut = 0;
   }
+  if ( isBufHalf() ) 
+    sendStatus();
   //  TODO: roll back to LocGet
 }
 
@@ -587,6 +649,18 @@ int bufGet()
     ret = buffer[bufLocGet];
     bufLocGetInc();
   } 
+  return ret;
+}
+
+boolean isBufHalf()
+{
+  boolean ret = false;
+  int d = bufLocPut - bufLocGet;
+  if ( d>0 ) {
+    if ( d>BUFFER_SIZE/3 ) ret = true;
+  } else if ( d<0 ) {
+    if ( -d<BUFFER_SIZE/3 ) ret = true;
+  }
   return ret;
 }
 
@@ -661,8 +735,11 @@ void checkSerial()
     if ( serialLoc > 0 && serialLen == 0 ) {
       if ( serialBuf[0] < 0x18 ) {
         (*cmdfun[serialBuf[0]])(serialBuf+1);
-      } else {
-        //  put it into buffer
+      } else {  //  put it into buffer
+        int i;
+        for ( i=0; i<cmdLen[serialBuf[0]]+1; i++ ) {
+          bufPut(serialBuf[i]);
+        }
       }
       serialLoc = 0;
     }
@@ -683,13 +760,13 @@ void cmdAdmin(byte buf[])
       Serial.write(buf[1]);
       break;  
     case 0x05:  //  return paddle ad value
-      Serial.write(0x00);
+      Serial.write(50);
       break;
     case 0x06:  //  return speed ad value
       Serial.write(map(speedPot,0,1023,0,63));
       break;
     case 0x07:  
-      //  TODO!
+      adminGetValues();
       break;  //  return all parameters
     case 0x08:  break;  //  reserved
     case 0x09:  //  return calibrating value
@@ -737,16 +814,20 @@ void cmdAdmin(byte buf[])
 
 void cmdSidetone(byte buf[])
 {
-  static short sidetone[] = {
-    4000, 2000, 1333, 1000, 800, 666, 571, 500, 444, 400
-  };
-
   byte b = buf[0];
-  if ( b & 0x80 ) isSidetone = false;
-  else isSidetone = true;
-  b &= 0x0F;
-  if ( b>=1 && b<=10 )
-    note = sidetone[b-1];
+  Serial.write(b);
+  if ( b & 0x80 ) {
+    isSidetone = false;
+    // Serial.println("paddle only");
+  } else {
+    isSidetone = true;
+    b &= 0x0F;
+    // Serial.write(b);
+    if ( b>=1 && b<=10 )
+      noteIndex = b-1;
+    // Serial.println(noteIndex);
+  }
+  saveParams();
 }
 
 void cmdSetSpeed(byte buf[])
@@ -757,6 +838,7 @@ void cmdSetSpeed(byte buf[])
   } else if ( buf[0] == 0 ) {
     isSpeedOverride = false;
   }
+  saveParams();
 }
 
 void cmdWeight(byte buf[])
@@ -764,12 +846,14 @@ void cmdWeight(byte buf[])
   if ( buf[0] >= 10 && buf[0] <= 90 ) {
     weight = buf[0];
   }
+  saveParams();
 }
 
 void cmdPTTTime(byte buf[])
 {
   rtxdelay = buf[0] * 10;
   pttdelay = buf[1] * 10;
+  saveParams();
 }
 
 void cmdSpeedRange(byte buf[])
@@ -777,6 +861,7 @@ void cmdSpeedRange(byte buf[])
   minWPM = buf[0];
   maxWPM = minWPM + buf[1];
   potRange = buf[2];
+  saveParams();
 }
 
 void cmdPause(byte buf[])
@@ -790,7 +875,7 @@ void cmdPause(byte buf[])
 
 void cmdGetSpeed(byte buf[])
 {
-  Serial.write(0x80 | (currentWPM - minWPM) );
+  sendSpeed();
 }
 
 void cmdBackspace(byte buf[])
@@ -810,13 +895,16 @@ void cmdClearBuffer(byte buf[])
 {
   bufLocGet = bufLocPut = 0;
   isPause = false;
+  if ( bfKeyDwnTimer >-1 ) {
+    bfKeyDwnTimer = millis();
+  }
 }
 
 void cmdKeyImd(byte buf[])  //  0x0B
 {
   if ( buf[0] ) {
     pttDown();
-    keyDown();
+    keyDown(false);
   } else {
     keyUp();
     pttUp();
@@ -831,12 +919,14 @@ void cmdHSCW(byte buf[])  //  0x0C
 void cmdFarnWPM(byte buf[])  //  0x0D
 {
   farmWPM = buf[0];
+  saveParams();
 }
 
 void cmdSetMode(byte buf[])  //  0x0E
 {
   wk2mode = buf[0];
   setPaddle(wk2mode);
+  saveParams();
 }
 
 void cmdDefault(byte buf[])  //  0x0F
@@ -853,16 +943,20 @@ void cmdDefault(byte buf[])  //  0x0F
   cmdPadSw(buf+11);
   cmdSetRatio(buf+12);
   cmdPinConfig(buf+13);
+  potRange = buf[14];
+  saveParams();
 }
 
 void cmdSetExt(byte buf[])  //  0x10
 {
   firstExtensionTime = buf[0];
+  saveParams();
 }
 
 void cmdKeyComp(byte buf[])  //  0x11
 {
   keyingCompensation = buf[0];
+  saveParams();
 }
 
 void cmdPadSw(byte buf[])  //  0x12
@@ -881,23 +975,7 @@ void cmdSoftPad(byte buf[])  //  0x14
 
 void cmdGetStatus(byte buf[])  //  0x15
 {
-  byte b = B11000010;
-  byte d;
-  if (  keyerState == KEYED_TRANS ||
-        keyerState == KEYED ||
-        keyerState == INTER_ELEMENT ||
-        (keyerState == IDLE && akState != AK_NONE )) {
-    b |= 0x10;
-  }
-  if ( keyerState == IDLE && akState != AK_NONE )
-    b |= 0x04;
-  d = bufLocPut - bufLocGet;
-  if ( d>0 ) {
-    if ( d>BUFFER_SIZE/3 ) b |= 0x01;
-  } else if ( d<0 ) {
-    if ( -d<BUFFER_SIZE/3 ) b |= 0x01;
-  }
-  Serial.write(b);
+  sendStatus();
 }
 
 void cmdPointer(byte buf[])  //  0x16
@@ -920,155 +998,142 @@ void cmdPointer(byte buf[])  //  0x16
 void cmdSetRatio(byte buf[])  //  0x17
 {
   didahRatio = 3.0*(buf[0]/50.0);
+  saveParams();
 }
 
-void cmdBPTT(byte buf[])  //  0x18
+void cmdBPTT()  //  0x18
 {
-
+  byte b = bufGet();
+  if ( b == 0x01 )
+    pttDown();
+  else if ( b == 0x00 ) 
+    pttUp();
 }
 
-void cmdBKey(byte buf[])  //  0x19
+void cmdBKey()  //  0x19
 {
-
+  byte b = bufGet();
+  if ( b >0 && b<99 ) {
+    keyDown(false);
+    bfKeyDwnTimer = millis() + b*1000;
+  }
 }
 
-void cmdBWait(byte buf[])  //  0x1A
+void cmdBWait()  //  0x1A
 {
-
+  byte b = bufGet();
+  if ( b >0 && b<99 )
+    delay(b*1000);
 }
 
-void cmdBMerge(byte buf[])  //  0x1B
+void cmdBMerge()  //  0x1B
 {
-
+  isMerge = true;
 }
 
-void cmdBSpeed(byte buf[])  //  0x1C
+void cmdBSpeed()  //  0x1C
 {
-
+  byte b = bufGet();
+  if ( origWPM == 0 )
+    origWPM = currentWPM;
+  if ( b>=5 && b<=99 )
+    setSpeed(b);
 }
 
-void cmdBHSpeed(byte buf[])  //  0x1D
+void cmdBHSpeed()  //  0x1D
 {
-
+  byte b = bufGet();
+  if ( origWPM == 0 )
+    origWPM = currentWPM;
+  if ( b>=5 && b<=99 )
+    setSpeed((int)b*20);
 }
 
-void cmdBCancelSpeed(byte buf[])  //  0x1E
+void cmdBCancelSpeed()  //  0x1E
 {
-
+  if ( origWPM != 0 ) {
+    setSpeed(origWPM);
+    origWPM = 0;
+  }
 }
 
-void cmdBNOP(byte buf[])  //  0x1F
+void cmdBNOP()  //  0x1F
 {
 }
 
-/*
-void winkey_admin_get_values_command() {
+void sendSpeed()
+{
+  Serial.write(0x80 | (currentWPM - minWPM) & 0x3F );
+}
 
+void sendStatus()
+{
+  byte b = B11000010;
+  byte d;
+  //  wait
+  if (  keyerState == KEYED_TRANS ||
+        keyerState == KEYED ||
+        keyerState == INTER_ELEMENT ||
+        (keyerState == IDLE && akState != AK_NONE )) {
+    b |= 0x10;
+  }
+  //  busy
+  if ( keyerState == IDLE && akState != AK_NONE )
+    b |= 0x04;
+  //  xoff
+  if ( isBufHalf() ) 
+    b |= 0x01;
+  Serial.write(b);
+}
+
+void adminGetValues() {
   byte byte_to_send;
 
   // 1 - mode register
-  byte_to_send = 0;
-  if (length_wordspace != default_length_wordspace) {
-    byte_to_send = byte_to_send | 1;
-  }
-  #ifdef FEATURE_AUTOSPACE
-  if (autospace_active) {
-    byte_to_send = byte_to_send | 2;
-  }
-  #endif
-  if (winkey_serial_echo) {
-    byte_to_send = byte_to_send | 4;
-  }
-  if (paddle_mode == PADDLE_REVERSE) {
-    byte_to_send = byte_to_send | 8;
-  }
-  switch (keyer_mode) {
-    case IAMBIC_A: byte_to_send = byte_to_send | 16; break;
-    case ULTIMATIC: byte_to_send = byte_to_send | 32; break;
-    case BUG: byte_to_send = byte_to_send | 48; break;
-  }
-  if (winkey_paddle_echo_activated) {
-    byte_to_send = byte_to_send | 64;
-  }
-  #ifdef FEATURE_DEAD_OP_WATCHDOG
-  if (dead_op_watchdog_active) {
-    byte_to_send = byte_to_send | 128;
-  }
-  #endif //FEATURE_DEAD_OP_WATCHDOG
-  Serial.write(byte_to_send);
+  Serial.write(wk2mode);
 
   // 2 - speed
-  if (wpm > 99) {
+  if (currentWPM > 99) {
     Serial.write(99);
   } else {
-    byte_to_send = wpm;
-    Serial.write(byte_to_send);
+    Serial.write(currentWPM);
   }
 
   // 3 - sidetone
-  switch(hz_sidetone) {
-    case WINKEY_SIDETONE_1 : Serial.write(1); break;
-    case WINKEY_SIDETONE_2 : Serial.write(2); break;
-    case WINKEY_SIDETONE_3 : Serial.write(3); break;
-    case WINKEY_SIDETONE_4 : Serial.write(4); break;
-    case WINKEY_SIDETONE_5 : Serial.write(5); break;
-    case WINKEY_SIDETONE_6 : Serial.write(6); break;
-    case WINKEY_SIDETONE_7 : Serial.write(7); break;
-    case WINKEY_SIDETONE_8 : Serial.write(8); break;
-    case WINKEY_SIDETONE_9 : Serial.write(9); break;
-    case WINKEY_SIDETONE_10 : Serial.write(10); break;
-    default: Serial.write(5); break;
-  }
+  Serial.write(noteIndex+1);
 
   // 4 - weight
-  Serial.write(weighting);
+  Serial.write(weight);
 
   // 5 - ptt lead
-  Serial.write(zero);   // TODO - backwards calculate this
+  Serial.write(rtxdelay/10);   // TODO - backwards calculate this
 
   // 6 - ptt tail
-  Serial.write(zero);   // TODO - backwards calculate this
+  Serial.write(pttdelay/10);   // TODO - backwards calculate this
 
   // 7 - pot min wpm
-  #ifdef FEATURE_POTENTIOMETER
-  Serial.write(pot_wpm_low_value);
-  #endif
-  #ifndef FEATURE_POTENTIOMETER
-  Serial.write(15);
-  #endif
-
+  Serial.write(minWPM);
+  
   // 8 - pot wpm range
-  #ifdef FEATURE_POTENTIOMETER
-  byte_to_send = pot_wpm_high_value - pot_wpm_low_value;
-  Serial.write(byte_to_send);
-  #endif
-  #ifndef FEATURE_POTENTIOMETER
-  Serial.write(20);
-  #endif
-
+  Serial.write(maxWPM-minWPM);
+  
   // 9 - 1st extension
-  Serial.write(first_extension_time);
+  Serial.write(firstExtensionTime);
 
   // 10 - compensation
-  Serial.write(keying_compensation);
+  Serial.write(keyingCompensation);
 
   // 11 - farnsworth wpm
-  #ifdef FEATURE_FARNSWORTH
-  byte_to_send = wpm_farnsworth;
-  Serial.write(byte_to_send);
-  #endif
-  #ifndef FEATURE_FARNSWORTH
-  Serial.write(zero);
-  #endif
+  Serial.write(farmWPM);
 
   // 12 - paddle setpoint
   Serial.write(50);  // default value
 
   // 13 - dah to dit ratio
-  Serial.write(50);  // TODO -backwards calculate
+  Serial.write((int)(didahRatio/3*50));  // TODO -backwards calculate
 
   // 14 - pin config
-  #ifdef OPTION_WINKEY_2_SUPPORT
+/*  #ifdef OPTION_WINKEY_2_SUPPORT
   byte_to_send = 0;
   if (current_ptt_line != 0) {byte_to_send = byte_to_send | 1;}
   if ((sidetone_mode == SIDETONE_ON) || (sidetone_mode == SIDETONE_PADDLE_ONLY)) {byte_to_send | 2;}
@@ -1081,17 +1146,107 @@ void winkey_admin_get_values_command() {
   if (ptt_hang_time_wordspace_units == 1.66) {byte_to_send = byte_to_send | 32;}
   if (ptt_hang_time_wordspace_units == 2.0) {byte_to_send = byte_to_send | 64;}
   Serial.write(byte_to_send);
-  #else
+  #else*/
   Serial.write(5); // default value
-  #endif
 
   // 15 - pot range
-  #ifdef OPTION_WINKEY_2_SUPPORT
-  Serial.write(zero);
-  #else
-  Serial.write(0xFF);
-  #endif
-
+  Serial.write(potRange);
 }
-*/
+
+static boolean isInLoad = false;
+
+void saveParams() 
+{
+  if ( isInLoad ) 
+    return;
+  Serial.println("Save to EEPROM");
+  // 0 - MagicNumber
+  EEPROM.write(0, 0xBA);
+  // 1 - mode register
+  EEPROM.write(1, wk2mode);
+  // 2 - speed
+  if (currentWPM > 99) {
+    EEPROM.write(2,99);
+  } else {
+    EEPROM.write(2,currentWPM);
+  }
+  // 3 - sidetone
+  EEPROM.write(3,noteIndex+1);
+
+  // 4 - weight
+  EEPROM.write(4,weight);
+
+  // 5 - ptt lead
+  EEPROM.write(5,rtxdelay/10);   // TODO - backwards calculate this
+
+  // 6 - ptt tail
+  EEPROM.write(6,pttdelay/10);   // TODO - backwards calculate this
+
+  // 7 - pot min wpm
+  EEPROM.write(7,minWPM);
+  
+  // 8 - pot wpm range
+  EEPROM.write(8,maxWPM-minWPM);
+  
+  // 9 - 1st extension
+  EEPROM.write(9,firstExtensionTime);
+
+  // 10 - compensation
+  EEPROM.write(10,keyingCompensation);
+
+  // 11 - farnsworth wpm
+  EEPROM.write(11,farmWPM);
+
+  // 12 - paddle setpoint
+  EEPROM.write(12,50);  // default value
+
+  // 13 - dah to dit ratio
+  EEPROM.write(13,(int)(didahRatio/3*50));  // TODO -backwards calculate
+
+  // 14 - pin config
+/*  #ifdef OPTION_WINKEY_2_SUPPORT
+  byte_to_send = 0;
+  if (current_ptt_line != 0) {byte_to_send = byte_to_send | 1;}
+  if ((sidetone_mode == SIDETONE_ON) || (sidetone_mode == SIDETONE_PADDLE_ONLY)) {byte_to_send | 2;}
+  if (current_tx_key_line == tx_key_line_1) {byte_to_send = byte_to_send | 4;}
+  if (current_tx_key_line == tx_key_line_2) {byte_to_send = byte_to_send | 8;}
+  if (wk2_both_tx_activated) {byte_to_send = byte_to_send | 12;}
+  if (ultimatic_mode == ULTIMATIC_DIT_PRIORITY) {byte_to_send = byte_to_send | 128;}
+  if (ultimatic_mode == ULTIMATIC_DAH_PRIORITY) {byte_to_send = byte_to_send | 64;}  
+  if (ptt_hang_time_wordspace_units == 1.33) {byte_to_send = byte_to_send | 16;}
+  if (ptt_hang_time_wordspace_units == 1.66) {byte_to_send = byte_to_send | 32;}
+  if (ptt_hang_time_wordspace_units == 2.0) {byte_to_send = byte_to_send | 64;}
+  Serial.write(byte_to_send);
+  #else*/
+  EEPROM.write(14,5); // default value
+
+  // 15 - pot range
+  EEPROM.write(15,potRange);
+}
+
+void loadParams()
+{
+  if ( EEPROM.read(0) == 0xBA ) {
+    byte tmp[15];
+    int i;
+    isInLoad = true;
+    Serial.println("Load from EEPROM");
+    for (i=0; i<15; i++ )
+      tmp[i] = EEPROM.read(i+1);
+    cmdSetMode(tmp);
+    cmdSetSpeed(tmp+1);
+    cmdSidetone(tmp+2);
+    cmdWeight(tmp+3);
+    cmdPTTTime(tmp+4);
+    cmdSpeedRange(tmp+6);
+    cmdSetExt(tmp+8);
+    cmdKeyComp(tmp+9);
+    cmdFarnWPM(tmp+10);
+    cmdPadSw(tmp+11);
+    cmdSetRatio(tmp+12);
+    cmdPinConfig(tmp+13);
+    potRange = tmp[14];
+    isInLoad = false;
+  }
+}
 
