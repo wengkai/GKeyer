@@ -32,7 +32,6 @@
 
 #include "EEPROM.h"
 
-
 //
 // Digital Pins
 //
@@ -59,13 +58,6 @@ const int keyPin   = 17;  // key out
 #define BUFFER_SIZE 64
 #define KEY_WD_TIMER  100*1000L
 
-//
-////////////////////////////////////////////////////////////////////////////////
-//
-//  Library Instantiations
-//
-////////////////////////////////////////////////////////////////////////////////
-//
 ///////////////////////////////////////////////////////////////////////////////
 //
 //  Global Variables
@@ -77,7 +69,7 @@ unsigned char keyerState;
 unsigned char noteIndex = 6;
 boolean       isPTTDown = false;
 unsigned int  pttdelay = 500;
-unsigned int  rtxdelay = 200; //  175;
+unsigned int  rtxdelay = 175; 
 int           speedPot;
 boolean       isSpeedOverride = false;  //  true if speed is set by host
 int           weight = 50;
@@ -247,6 +239,8 @@ void setup() {
 
   loadParams();
 
+  isSpeedOverride = false;
+
   checkSpeed();
   
   prompt();
@@ -264,22 +258,33 @@ void loop()
   // keyerControl contains processing flags and keyer mode bits
   // Supports Iambic A and B
   // State machine based, uses calls to millis() for timing.
+  
+  //  check if speed pot has been changed
   checkSpeed();
+  //  check if something is coming via the serial port
   checkSerial();
+
+  //  if key is down, check two watch-dogs
   if ( isKeyDown ) {
+    //  a total key-down watch-dog
     if ( millis() > keyWDTimer ) {
       keyUp();
       pttUp();
     }
+    //  buffered key command timer
     if ( bfKeyDwnTimer >-1 && millis() > bfKeyDwnTimer ) {
       keyUp();
       pttUp();
       bfKeyDwnTimer = -1;  
     }
   }
+
+  //  the state-machine
   switch (keyerState) {
   case IDLE:
+    //  check if there's something in the buffer
     checkAK();
+
     // Wait for direct or latched paddle press
     if ( keyerControl & STRAITKEY ) {
       if ( digitalRead(RPin) == LOW ) {
@@ -299,8 +304,9 @@ void loop()
       update_PaddleLatch();
       keyerState = CHK_DIT;
     }
+
+    //  check if ptt timed-out
     if ( isPTTDown && ptimer >-1 && millis() >= ptimer ) {
-//      Serial.println(ptimer);
       pttUp();
     }
     break;
@@ -373,14 +379,22 @@ void loop()
     break;
   }
 }
-      
+
+void keyedPrep()
+{
+  if ( !isPTTDown ) {
+    pttDown();
+  }
+  rtimer = millis();
+}
+
 void pttDown()
 {
   if ( !isPTTDown ) {
 //    Serial.println("ptt down");
     digitalWrite(pttPin, LOW);         // enable PTT
     digitalWrite(gLedPin, LOW);
-    isPTTDown = true;
+    // isPTTDown = true;
     ptimer = -1;
   }
 } 
@@ -477,6 +491,7 @@ void checkAK()
     break;
   case AK_RTX:
     if ( millis() >= akTimer ) {
+      isPTTDown = true;
       keyDown(false);
       calAKTimer();
       akTimer += firstExtensionTime;
@@ -582,7 +597,7 @@ void checkSpeed()
       if ( wpm >= 30 ) 
         rtxdelay = 5;
       else 
-        rtxdelay = 200; //175;
+        rtxdelay = 175;
     }
   }
 }
@@ -591,14 +606,6 @@ void setSpeed(byte wpm)
 {
   currentWPM = wpm;
   ditTime = 1200/wpm;
-}
-
-void keyedPrep()
-{
-  if ( !isPTTDown ) {
-    pttDown();
-  }
-  rtimer = millis();
 }
 
 void prompt()
@@ -1159,7 +1166,7 @@ void saveParams()
 {
   if ( isInLoad ) 
     return;
-  Serial.println("Save to EEPROM");
+  // Serial.println("Save to EEPROM");
   // 0 - MagicNumber
   EEPROM.write(0, 0xBA);
   // 1 - mode register
@@ -1230,7 +1237,7 @@ void loadParams()
     byte tmp[15];
     int i;
     isInLoad = true;
-    Serial.println("Load from EEPROM");
+    // Serial.println("Load from EEPROM");
     for (i=0; i<15; i++ )
       tmp[i] = EEPROM.read(i+1);
     cmdSetMode(tmp);
